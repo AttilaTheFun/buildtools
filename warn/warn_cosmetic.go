@@ -103,89 +103,222 @@ func sameOriginLoadWarning(f *build.File) []*LinterFinding {
 }
 
 func packageOnTopWarning(f *build.File) []*LinterFinding {
-	seenRule := false
-	for _, stmt := range f.Stmt {
-		_, isString := stmt.(*build.StringExpr) // typically a docstring
-		_, isComment := stmt.(*build.CommentBlock)
-		_, isAssignExpr := stmt.(*build.AssignExpr) // e.g. variable declaration
-		_, isLoad := stmt.(*build.LoadStmt)
-		_, isPackageGroup := edit.ExprToRule(stmt, "package_group")
-		_, isLicense := edit.ExprToRule(stmt, "licenses")
-		if isString || isComment || isAssignExpr || isLoad || isPackageGroup || isLicense || stmt == nil {
-			continue
-		}
-		if rule, ok := edit.ExprToRule(stmt, "package"); ok {
-			if !seenRule { // OK: package is on top of the file
-				return nil
-			}
-			return []*LinterFinding{makeLinterFinding(rule.Call,
-				"Package declaration should be at the top of the file, after the load() statements, "+
-					"but before any call to a rule or a macro. "+
-					"package_group() and licenses() may be called before package().")}
-		}
-		seenRule = true
-	}
+	// DEPRECATED -- Merged into statementOrderWarning
 	return nil
 }
 
 func loadOnTopWarning(f *build.File) []*LinterFinding {
+	// DEPRECATED -- Merged into statementOrderWarning
+	return nil
+}
+
+// func packageOnTopWarning(f *build.File) []*LinterFinding {
+// 	seenRule := false
+// 	for _, stmt := range f.Stmt {
+// 		_, isString := stmt.(*build.StringExpr) // typically a docstring
+// 		_, isComment := stmt.(*build.CommentBlock)
+// 		_, isAssignExpr := stmt.(*build.AssignExpr) // e.g. variable declaration
+// 		_, isLoad := stmt.(*build.LoadStmt)
+// 		_, isPackageGroup := edit.ExprToRule(stmt, "package_group")
+// 		_, isLicense := edit.ExprToRule(stmt, "licenses")
+// 		if isString || isComment || isAssignExpr || isLoad || isPackageGroup || isLicense || stmt == nil {
+// 			continue
+// 		}
+// 		if rule, ok := edit.ExprToRule(stmt, "package"); ok {
+// 			if !seenRule { // OK: package is on top of the file
+// 				return nil
+// 			}
+// 			return []*LinterFinding{makeLinterFinding(rule.Call,
+// 				"Package declaration should be at the top of the file, after the load() statements, "+
+// 					"but before any call to a rule or a macro. "+
+// 					"package_group() and licenses() may be called before package().")}
+// 		}
+// 		seenRule = true
+// 	}
+// 	return nil
+// }
+
+func reverse(s1 []int) []int {
+	var s2 []int
+	for i := len(s1) - 1; i >= 0; i-- {
+		s2 = append(s2, s1[i])
+	}
+	return s2
+}
+
+func dropLast(s []int) []int {
+	if len(s) == 0 {
+		return s
+	}
+
+	return s[:len(s)-1]
+}
+
+// swapTracker implements sort.Interface to sort a slice while tracking the swaps
+type swapTracker struct {
+	Slice []int
+	Swaps map[int]int
+}
+
+func (t swapTracker) Len() int {
+	return len(t.Slice)
+}
+
+func (t swapTracker) Less(i, j int) bool {
+	return t.Slice[i] < t.Slice[j]
+}
+
+func (t swapTracker) Swap(i, j int) {
+	t.Slice[i], t.Slice[j] = t.Slice[j], t.Slice[i]
+	if _, ok := t.Swaps[i]; ok {
+		panic("element has already been swapped")
+	}
+	t.Swaps[i] = j
+}
+
+func statementOrderWarning(f *build.File) []*LinterFinding {
 	if f.Type == build.TypeWorkspace || f.Type == build.TypeModule {
 		// Not applicable to WORKSPACE or MODULE files
 		return nil
 	}
 
+	// The order of statements in the file should be as follows:
+	// 1. Load statements (if any)
+	// 3. Package statement (if any)
+	// 2. License statement (if any)
+	// 5. Any other statements
+	// String literals or comments can be interspersed anywhere in the file, e.g. as docstrings.
+	// This warning will attempt to preserve the order of statements as much as possible while adhering to these rules.
+	// These rules are based on recommendations in Bazel's documentation:
+	// https://docs.bazel.build/versions/0.24.0/be/functions.html#package
+	// https://docs.bazel.build/versions/0.24.0/be/functions.html#licenses
+
 	// Find the misplaced load statements
-	misplacedLoads := make(map[int]*build.LoadStmt)
-	firstStmtIndex := -1 // index of the first seen non-load statement
+	stringAndCommentStatementIndices := []int{}
+	loadStatementIndicies := []int{}
+	packageStatementIndices := []int{}
+	licenseStatementIndices := []int{}
+	otherStatementIndices := []int{}
 	for i := 0; i < len(f.Stmt); i++ {
 		stmt := f.Stmt[i]
-		_, isString := stmt.(*build.StringExpr) // typically a docstring
+
+		// Determine the statement type:
+		_, isString := stmt.(*build.StringExpr)
 		_, isComment := stmt.(*build.CommentBlock)
-		if isString || isComment || stmt == nil {
-			continue
+		_, isLoad := stmt.(*build.LoadStmt)
+		_, isPackage := edit.ExprToRule(stmt, "package")
+		_, isLicense := edit.ExprToRule(stmt, "licenses")
+
+		// Switch on the statement type and add to the appropriate collection:
+		switch {
+		case isString || isComment:
+			stringAndCommentStatementIndices = append(stringAndCommentStatementIndices, i)
+		case isLoad:
+			loadStatementIndicies = append(loadStatementIndicies, i)
+		case isPackage:
+			packageStatementIndices = append(packageStatementIndices, i)
+		case isLicense:
+			licenseStatementIndices = append(licenseStatementIndices, i)
+		default:
+			otherStatementIndices = append(otherStatementIndices, i)
 		}
-		load, ok := stmt.(*build.LoadStmt)
-		if !ok {
-			if firstStmtIndex == -1 {
-				firstStmtIndex = i
-			}
-			continue
-		}
-		if firstStmtIndex == -1 {
-			continue
-		}
-		misplacedLoads[i] = load
 	}
 
-	// Calculate a fix
-	if firstStmtIndex == -1 {
-		firstStmtIndex = 0
+	// Reverse the slices for more efficient pops:
+	stringAndCommentStatementIndices = reverse(stringAndCommentStatementIndices)
+	loadStatementIndicies = reverse(loadStatementIndicies)
+	packageStatementIndices = reverse(packageStatementIndices)
+	licenseStatementIndices = reverse(licenseStatementIndices)
+	otherStatementIndices = reverse(otherStatementIndices)
+
+	// Build a slice of the original statement indices in the desired order:
+	desiredStatementIndices := []int{}
+	for len(loadStatementIndicies) > 0 {
+		currentLoadStatementIndex := loadStatementIndicies[len(loadStatementIndicies)-1]
+
+		// Take the earliest index of the string/comment and the load statement:
+		if len(stringAndCommentStatementIndices) > 0 {
+			currentStringAndCommentStatementIndex := stringAndCommentStatementIndices[len(stringAndCommentStatementIndices)-1]
+			if currentStringAndCommentStatementIndex < currentLoadStatementIndex {
+				desiredStatementIndices = append(desiredStatementIndices, currentStringAndCommentStatementIndex)
+				stringAndCommentStatementIndices = dropLast(stringAndCommentStatementIndices)
+				continue
+			}
+		}
+
+		// Otherwise, just take the load statement index:
+		desiredStatementIndices = append(desiredStatementIndices, currentLoadStatementIndex)
+		loadStatementIndicies = dropLast(loadStatementIndicies)
 	}
-	offset := len(misplacedLoads)
+	for len(packageStatementIndices) > 0 {
+		currentPackageStatementIndex := packageStatementIndices[len(packageStatementIndices)-1]
+
+		// Take the earliest index of the string/comment and the package statement:
+		if len(stringAndCommentStatementIndices) > 0 {
+			currentStringAndCommentStatementIndex := stringAndCommentStatementIndices[len(stringAndCommentStatementIndices)-1]
+			if currentStringAndCommentStatementIndex < currentPackageStatementIndex {
+				desiredStatementIndices = append(desiredStatementIndices, currentStringAndCommentStatementIndex)
+				stringAndCommentStatementIndices = dropLast(stringAndCommentStatementIndices)
+				continue
+			}
+		}
+
+		// Otherwise, just take the package statement index:
+		desiredStatementIndices = append(desiredStatementIndices, currentPackageStatementIndex)
+		packageStatementIndices = dropLast(packageStatementIndices)
+	}
+	for len(licenseStatementIndices) > 0 {
+		currentLicenseStatementIndex := licenseStatementIndices[len(licenseStatementIndices)-1]
+
+		// Take the earliest index of the string/comment and the license statement:
+		if len(stringAndCommentStatementIndices) > 0 {
+			currentStringAndCommentStatementIndex := stringAndCommentStatementIndices[len(stringAndCommentStatementIndices)-1]
+			if currentStringAndCommentStatementIndex < currentLicenseStatementIndex {
+				desiredStatementIndices = append(desiredStatementIndices, currentStringAndCommentStatementIndex)
+				stringAndCommentStatementIndices = dropLast(stringAndCommentStatementIndices)
+				continue
+			}
+		}
+
+		// Otherwise, just take the license statement index:
+		desiredStatementIndices = append(desiredStatementIndices, currentLicenseStatementIndex)
+		licenseStatementIndices = dropLast(licenseStatementIndices)
+	}
+	for len(otherStatementIndices) > 0 {
+		currentOtherStatementIndex := otherStatementIndices[len(otherStatementIndices)-1]
+
+		// Take the earliest index of the string/comment and the other statement:
+		if len(stringAndCommentStatementIndices) > 0 {
+			currentStringAndCommentStatementIndex := stringAndCommentStatementIndices[len(stringAndCommentStatementIndices)-1]
+			if currentStringAndCommentStatementIndex < currentOtherStatementIndex {
+				desiredStatementIndices = append(desiredStatementIndices, currentStringAndCommentStatementIndex)
+				stringAndCommentStatementIndices = dropLast(stringAndCommentStatementIndices)
+				continue
+			}
+		}
+
+		// Otherwise, just take the other statement index:
+		desiredStatementIndices = append(desiredStatementIndices, currentOtherStatementIndex)
+		otherStatementIndices = dropLast(otherStatementIndices)
+	}
+
+	// Now that we have the correct order for the statements, sort this and track the swaps:
+	st := swapTracker{
+		Slice: desiredStatementIndices,
+		Swaps: map[int]int{},
+	}
+	sort.Sort(st)
+
+	// Build a collection of replacements from the swaps:
 	var replacements []LinterReplacement
-	for i := range f.Stmt {
-		if i < firstStmtIndex {
-			// Docstring or a comment in the beginning, skip
-			continue
-		} else if _, ok := misplacedLoads[i]; ok {
-			// A misplaced load statement, should be moved up to the `firstStmtIndex` position
-			replacements = append(replacements, LinterReplacement{&f.Stmt[firstStmtIndex], f.Stmt[i]})
-			firstStmtIndex++
-			offset--
-			if offset == 0 {
-				// No more statements should be moved
-				break
-			}
-		} else {
-			// An actual statement (not a docstring or a comment in the beginning), should be moved
-			// `offset` positions down.
-			replacements = append(replacements, LinterReplacement{&f.Stmt[i+offset], f.Stmt[i]})
-		}
+	for originalIndex, newIndex := range st.Swaps {
+		replacements = append(replacements, LinterReplacement{&f.Stmt[originalIndex], f.Stmt[newIndex]})
 	}
 
+	// Create a linter finding with the replacements (if any):
 	var findings []*LinterFinding
-	for _, load := range misplacedLoads {
-		findings = append(findings, makeLinterFinding(load, "Load statements should be at the top of the file.", replacements...))
+	if len(replacements) > 0 {
+		findings = append(findings, makeLinterFinding(*replacements[0].Old, "Statement order: load, package, license, others", replacements...))
 	}
 
 	return findings
